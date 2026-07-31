@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lake Powell Interactive Time Lapse Map</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255,255,255,0.10);
+    --blue: #3987e5;
+    --aqua: #199e70;
+  }
+  * { margin: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: var(--page);
+    color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 14px;
+    padding: 10px 16px 8px; border-bottom: 1px solid var(--grid);
+  }
+  header h1 { font-size: 17px; font-weight: 650; }
+  header .sub { color: var(--muted); font-size: 12.5px; }
+  header .now { margin-left: auto; color: var(--ink-2); font-size: 12.5px; }
+  header .now b { color: var(--ink); font-variant-numeric: tabular-nums; }
+
+  #layout { flex: 1; display: flex; min-height: 0; }
+
+  /* ---------- stage ---------- */
+  #stageWrap { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #stage {
+    flex: 1; position: relative; overflow: hidden;
+    background: #000; cursor: grab; touch-action: none; min-height: 0;
+  }
+  #stage.dragging { cursor: grabbing; }
+  .pan { position: absolute; inset: 0; transform-origin: 0 0; }
+  .pan img {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: contain; user-select: none; -webkit-user-drag: none;
+  }
+  #compareLayer { position: absolute; inset: 0; display: none; }
+  body.compare #compareLayer { display: block; }
+  #divider {
+    position: absolute; top: 0; bottom: 0; width: 3px; margin-left: -1.5px;
+    background: rgba(255,255,255,0.85); cursor: ew-resize; display: none; z-index: 4;
+  }
+  body.compare #divider { display: block; }
+  #divider::after {
+    content: "◂ ▸"; position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%,-50%); background: rgba(0,0,0,0.65);
+    border: 1px solid var(--border); border-radius: 20px;
+    padding: 4px 9px; font-size: 11px; white-space: nowrap; color: var(--ink-2);
+  }
+  .yearTag {
+    position: absolute; top: 10px; z-index: 3; pointer-events: none;
+    font-size: 34px; font-weight: 700; letter-spacing: 0.5px;
+    color: #fff; text-shadow: 0 1px 6px rgba(0,0,0,0.9);
+    font-variant-numeric: tabular-nums;
+  }
+  #tagB { right: 16px; }
+  #tagA { left: 16px; display: none; }
+  body.compare #tagA { display: block; }
+  #loadNote {
+    position: absolute; left: 12px; bottom: 10px; z-index: 3;
+    color: var(--ink-2); font-size: 12px; background: rgba(0,0,0,0.55);
+    padding: 3px 8px; border-radius: 6px; display: none;
+  }
+  #resetView {
+    position: absolute; right: 12px; bottom: 10px; z-index: 3; display: none;
+  }
+
+  /* ---------- side panel ---------- */
+  #panel {
+    width: 400px; flex: none; border-left: 1px solid var(--grid);
+    background: var(--surface); padding: 14px 16px;
+    display: flex; flex-direction: column; gap: 12px; overflow-y: auto;
+  }
+  #controls { display: flex; align-items: center; gap: 8px; }
+  button, select {
+    background: #242423; color: var(--ink); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; font: inherit; cursor: pointer;
+  }
+  button:hover { background: #2e2e2c; }
+  button.primary { font-size: 16px; padding: 6px 14px; }
+  button.active { background: var(--blue); border-color: var(--blue); }
+  #slider { width: 100%; accent-color: var(--blue); }
+  #speed { margin-left: auto; }
+
+  #stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; }
+  .stat { background: #202020; border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; }
+  .stat .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .stat .v { font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 1px; }
+  .stat .d { color: var(--ink-2); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .stat .d.drop { color: #e66767; }
+
+  .chartBox h3 { font-size: 12px; color: var(--ink-2); font-weight: 600; margin-bottom: 4px; }
+  .chartBox canvas { width: 100%; height: 110px; display: block; cursor: pointer; }
+  #tooltip {
+    position: fixed; z-index: 10; pointer-events: none; display: none;
+    background: #242423; border: 1px solid var(--border); border-radius: 8px;
+    padding: 5px 9px; font-size: 12px; color: var(--ink);
+    box-shadow: 0 4px 14px rgba(0,0,0,0.5); font-variant-numeric: tabular-nums;
+  }
+  #compareRow { display: flex; align-items: center; gap: 8px; }
+  #compareRow label { color: var(--ink-2); font-size: 12.5px; }
+  #footnote { color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+  #sceneLine { color: var(--ink-2); font-size: 12.5px; }
+  #sceneLine b { color: var(--ink); }
+
+  @media (max-width: 900px) {
+    #layout { flex-direction: column; overflow-y: auto; }
+    #stage { min-height: 58vh; }
+    #panel { width: auto; border-left: none; border-top: 1px solid var(--grid); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Lake Powell</h1>
+  <span class="sub" id="subLine">yearly Landsat timelapse · Glen Canyon Dam → Hite</span>
+  <span class="now" id="nowLine"></span>
+</header>
+
+<div id="layout">
+  <div id="stageWrap">
+    <div id="stage">
+      <div class="pan" id="panB"><img id="imgB" alt="satellite frame"></div>
+      <div id="compareLayer"><div class="pan" id="panA"><img id="imgA" alt="compare frame"></div></div>
+      <div id="divider"></div>
+      <div class="yearTag" id="tagA"></div>
+      <div class="yearTag" id="tagB"></div>
+      <div id="loadNote"></div>
+      <button id="resetView">Reset view</button>
+    </div>
+  </div>
+
+  <div id="panel">
+    <div id="controls">
+      <button id="prev" title="Previous year (←)">⏮</button>
+      <button id="play" class="primary" title="Play/pause (space)">▶</button>
+      <button id="next" title="Next year (→)">⏭</button>
+      <select id="speed" title="Playback speed">
+        <option value="900">Slow</option>
+        <option value="450" selected>Normal</option>
+        <option value="220">Fast</option>
+        <option value="120">Very fast</option>
+      </select>
+    </div>
+    <input type="range" id="slider" min="0" max="1" value="0" step="1">
+
+    <div id="sceneLine"></div>
+
+    <div id="stats">
+      <div class="stat"><div class="k">Pool elevation</div><div class="v" id="sElev">–</div><div class="d" id="sElevD"></div></div>
+      <div class="stat"><div class="k">Storage</div><div class="v" id="sStor">–</div><div class="d" id="sStorD"></div></div>
+      <div class="stat"><div class="k">Imaged water area</div><div class="v" id="sArea">–</div><div class="d" id="sAreaD"></div></div>
+      <div class="stat"><div class="k">Scene quality</div><div class="v" id="sCloud">–</div><div class="d" id="sCloudD"></div></div>
+    </div>
+
+    <div id="compareRow">
+      <button id="compareBtn">Compare</button>
+      <label for="compareYear">left side:</label>
+      <select id="compareYear"></select>
+    </div>
+
+    <div class="chartBox">
+      <h3>Pool elevation, summer mean (ft) · 1963–2026</h3>
+      <canvas id="chartElev"></canvas>
+    </div>
+    <div class="chartBox">
+      <h3>Water surface area from imagery (km²) · 1984–2026</h3>
+      <canvas id="chartArea"></canvas>
+    </div>
+
+    <div id="footnote">
+      Imagery: Landsat Collection 2 (USGS) via Microsoft Planetary Computer —
+      clearest June–October scenes each year, mosaicked at 75 m/px, scored for cloud
+      over the lake itself. 1972–1983 use the early MSS sensor (60 m, no blue band:
+      color is simulated, slightly rosier) — the lake was still filling until 1980.
+      Water area = MNDWI water pixels (NDWI pre-1984) — narrow canyon arms are
+      under-resolved, so treat it as a relative index. Elevation/storage: Bureau of
+      Reclamation daily hydrodata, June–September mean. Full pool = 3,700 ft /
+      24.32 M acre-ft. Scroll to zoom, drag to pan. 2012 is Landsat 7 (striping).
+    </div>
+  </div>
+</div>
+<div id="tooltip"></div>
+
+<script src="manifest.js"></script>
+<script src="elevation.js"></script>
+<script>
+const YEARS = TIMELAPSE.years.map(e => e.year);
+const META = Object.fromEntries(TIMELAPSE.years.map(e => [e.year, e]));
+const ELEV = ELEVATION.years;
+const FULL_POOL_FT = ELEVATION.full_pool_ft;
+const FULL_POOL_AF = 24322000;
+const $ = id => document.getElementById(id);
+
+/* ---------- header ---------- */
+{
+  document.title = `Lake Powell Interactive Time Lapse Map · ${YEARS[0]}–${YEARS[YEARS.length - 1]}`;
+  $("subLine").textContent =
+    `yearly Landsat timelapse · ${YEARS[0]}–${YEARS[YEARS.length - 1]} · Glen Canyon Dam → Hite`;
+  const L = ELEVATION.latest;
+  $("nowLine").innerHTML =
+    `today: <b>${L.elevation_ft.toFixed(1)} ft</b> ` +
+    `(${(FULL_POOL_FT - L.elevation_ft).toFixed(0)} ft below full pool, ${L.date})`;
+}
+
+/* ---------- preload ---------- */
+const cache = {};
+let loaded = 0;
+const note = $("loadNote");
+note.style.display = "block";
+for (const y of YEARS) {
+  const im = new Image();
+  im.src = `frames/${y}.jpg`;
+  im.onload = im.onerror = () => {
+    loaded++;
+    note.textContent = `loading frames ${loaded}/${YEARS.length}`;
+    if (loaded === YEARS.length) note.style.display = "none";
+  };
+  cache[y] = im;
+}
+
+/* ---------- state ---------- */
+let idx = 0;                 // current frame index (right side / main)
+let playing = false, timer = null;
+let compare = false;
+
+const slider = $("slider");
+slider.max = YEARS.length - 1;
+
+const fmt = n => n.toLocaleString("en-US");
+
+function setFrame(i, fromSlider) {
+  idx = Math.max(0, Math.min(YEARS.length - 1, i));
+  const y = YEARS[idx];
+  $("imgB").src = cache[y].src;
+  $("tagB").textContent = y;
+  if (!fromSlider) slider.value = idx;
+
+  const m = META[y];
+  const e = ELEV[y] || {};
+  $("sceneLine").innerHTML =
+    `<b>${y}</b> · ${m.dates.join(" + ")} · ` +
+    m.platforms.map(p => p.replace("landsat-", "Landsat ")).join(", ");
+
+  if (e.elevation_ft) {
+    $("sElev").textContent = fmt(Math.round(e.elevation_ft)) + " ft";
+    $("sElevD").textContent = (FULL_POOL_FT - e.elevation_ft).toFixed(0) + " ft below full";
+    $("sElevD").className = "d" + (FULL_POOL_FT - e.elevation_ft > 60 ? " drop" : "");
+  } else { $("sElev").textContent = "–"; $("sElevD").textContent = ""; }
+
+  if (e.storage_af) {
+    $("sStor").textContent = (e.storage_af / 1e6).toFixed(2) + " M af";
+    const pct = Math.round(100 * e.storage_af / FULL_POOL_AF);
+    $("sStorD").textContent = pct + "% of full pool";
+    $("sStorD").className = "d" + (pct < 50 ? " drop" : "");
+  } else { $("sStor").textContent = "–"; $("sStorD").textContent = ""; }
+
+  if (m.sensor === "MSS") {
+    $("sArea").textContent = "n/a";
+    $("sAreaD").textContent = "MSS sensor too coarse";
+    $("sAreaD").className = "d";
+  } else {
+    $("sArea").textContent = fmt(Math.round(m.area_km2)) + " km²";
+    const base = TIMELAPSE.years.find(e => e.sensor !== "MSS");
+    const rel = Math.round(100 * (m.area_km2 - base.area_km2) / base.area_km2);
+    $("sAreaD").textContent = (rel >= 0 ? "+" : "") + rel + "% vs " + base.year;
+    $("sAreaD").className = "d" + (rel < -10 ? " drop" : "");
+  }
+
+  const lakeCloud = m.aoi_cloud != null ? Math.round(m.aoi_cloud * 100) : m.cloud;
+  $("sCloud").textContent = lakeCloud + "% cloud";
+  $("sCloudD").textContent = m.scenes + " scene" + (m.scenes > 1 ? "s" : "") +
+    ", " + Math.round(m.coverage * 100) + "% coverage";
+
+  drawCharts();
+}
+
+/* ---------- playback ---------- */
+function setPlaying(on) {
+  playing = on;
+  $("play").textContent = on ? "⏸" : "▶";
+  clearInterval(timer);
+  if (on) timer = setInterval(() => setFrame((idx + 1) % YEARS.length), +$("speed").value);
+}
+$("play").onclick = () => setPlaying(!playing);
+$("speed").onchange = () => { if (playing) setPlaying(true); };
+$("prev").onclick = () => { setPlaying(false); setFrame(idx - 1); };
+$("next").onclick = () => { setPlaying(false); setFrame(idx + 1); };
+slider.oninput = () => { setPlaying(false); setFrame(+slider.value, true); };
+document.addEventListener("keydown", ev => {
+  if (ev.target.tagName === "SELECT") return;
+  if (ev.code === "Space") { ev.preventDefault(); setPlaying(!playing); }
+  if (ev.code === "ArrowLeft") { setPlaying(false); setFrame(idx - 1); }
+  if (ev.code === "ArrowRight") { setPlaying(false); setFrame(idx + 1); }
+});
+
+/* ---------- compare mode ---------- */
+const cmpSel = $("compareYear");
+for (const y of YEARS) cmpSel.add(new Option(y, y));
+cmpSel.value = YEARS[0];
+let divPos = 0.5;
+
+function setCompare(on) {
+  compare = on;
+  document.body.classList.toggle("compare", on);
+  $("compareBtn").classList.toggle("active", on);
+  if (on) updateCompare();
+}
+function updateCompare() {
+  const yA = +cmpSel.value;
+  $("imgA").src = cache[yA].src;
+  $("tagA").textContent = yA + " ◂";
+  $("tagB").textContent = compare ? "▸ " + YEARS[idx] : YEARS[idx];
+  positionDivider();
+}
+$("compareBtn").onclick = () => setCompare(!compare);
+cmpSel.onchange = updateCompare;
+
+const stage = $("stage");
+function positionDivider() {
+  $("divider").style.left = (divPos * 100) + "%";
+  $("compareLayer").style.clipPath = `inset(0 ${(1 - divPos) * 100}% 0 0)`;
+}
+$("divider").addEventListener("pointerdown", ev => {
+  ev.stopPropagation();
+  ev.preventDefault();
+  const div = $("divider");
+  div.setPointerCapture(ev.pointerId);
+  const move = e => {
+    divPos = Math.max(0.02, Math.min(0.98, (e.clientX - stage.getBoundingClientRect().left) / stage.clientWidth));
+    positionDivider();
+  };
+  const done = () => {
+    div.removeEventListener("pointermove", move);
+    div.removeEventListener("pointerup", done);
+    div.removeEventListener("pointercancel", done);
+  };
+  div.addEventListener("pointermove", move);
+  div.addEventListener("pointerup", done);
+  div.addEventListener("pointercancel", done);
+});
+
+/* ---------- zoom / pan (shared by both layers) ---------- */
+let scale = 1, tx = 0, ty = 0;
+function applyTransform() {
+  const t = `translate(${tx}px, ${ty}px) scale(${scale})`;
+  $("panA").style.transform = t;
+  $("panB").style.transform = t;
+  $("resetView").style.display = scale > 1.01 ? "block" : "none";
+}
+stage.addEventListener("wheel", ev => {
+  ev.preventDefault();
+  const r = stage.getBoundingClientRect();
+  const mx = ev.clientX - r.left, my = ev.clientY - r.top;
+  const f = ev.deltaY < 0 ? 1.25 : 0.8;
+  const ns = Math.max(1, Math.min(14, scale * f));
+  tx = mx - (mx - tx) * (ns / scale);
+  ty = my - (my - ty) * (ns / scale);
+  scale = ns;
+  if (scale === 1) { tx = ty = 0; }
+  applyTransform();
+}, { passive: false });
+stage.addEventListener("pointerdown", ev => {
+  if (ev.target.id === "divider") return;
+  stage.classList.add("dragging");
+  stage.setPointerCapture(ev.pointerId);
+  let lx = ev.clientX, ly = ev.clientY;
+  const move = e => { tx += e.clientX - lx; ty += e.clientY - ly; lx = e.clientX; ly = e.clientY; applyTransform(); };
+  const done = () => {
+    stage.classList.remove("dragging");
+    stage.removeEventListener("pointermove", move);
+    stage.removeEventListener("pointerup", done);
+    stage.removeEventListener("pointercancel", done);
+  };
+  stage.addEventListener("pointermove", move);
+  stage.addEventListener("pointerup", done);
+  stage.addEventListener("pointercancel", done);
+});
+$("resetView").onclick = () => { scale = 1; tx = ty = 0; applyTransform(); };
+
+/* ---------- charts ---------- */
+const tooltip = $("tooltip");
+function buildChart(canvas, series, opts) {
+  // series: [{x: year, y: value}] sorted; opts: {color, refLine, fmtVal}
+  const ctx = canvas.getContext("2d");
+  function draw(hoverX) {
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    const padL = 44, padR = 8, padT = 8, padB = 16;
+    const xs = series.map(p => p.x), ys = series.map(p => p.y);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs);
+    let y0 = Math.min(...ys), y1 = Math.max(...ys);
+    if (opts.refLine) y1 = Math.max(y1, opts.refLine.value);
+    const span = (y1 - y0) || 1; y0 -= span * 0.06; y1 += span * 0.06;
+    const X = x => padL + (x - x0) / (x1 - x0) * (W - padL - padR);
+    const Y = y => padT + (1 - (y - y0) / (y1 - y0)) * (H - padT - padB);
+
+    ctx.font = "10.5px system-ui, sans-serif";
+    // gridlines + y ticks
+    ctx.strokeStyle = "#2c2c2a"; ctx.fillStyle = "#898781"; ctx.lineWidth = 1;
+    const ticks = 3;
+    for (let i = 0; i <= ticks; i++) {
+      const v = y0 + (y1 - y0) * i / ticks, yy = Math.round(Y(v)) + 0.5;
+      ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(W - padR, yy); ctx.stroke();
+      ctx.textAlign = "right"; ctx.textBaseline = "middle";
+      ctx.fillText(Math.round(v).toLocaleString(), padL - 5, yy);
+    }
+    // x ticks (decades)
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    for (let x = Math.ceil(x0 / 10) * 10; x <= x1; x += 10)
+      ctx.fillText(x, X(x), H - padB + 3);
+    // reference line
+    if (opts.refLine) {
+      const yy = Math.round(Y(opts.refLine.value)) + 0.5;
+      ctx.strokeStyle = "#898781"; ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(W - padR, yy); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.textAlign = "left"; ctx.textBaseline = "bottom"; ctx.fillStyle = "#898781";
+      ctx.fillText(opts.refLine.label, padL + 4, yy - 2);
+    }
+    // current-year marker
+    const cy = YEARS[idx];
+    if (cy >= x0 && cy <= x1) {
+      ctx.strokeStyle = "#565650";
+      ctx.beginPath(); ctx.moveTo(X(cy) + 0.5, padT); ctx.lineTo(X(cy) + 0.5, H - padB); ctx.stroke();
+    }
+    // series line
+    ctx.strokeStyle = opts.color; ctx.lineWidth = 2; ctx.lineJoin = "round";
+    ctx.beginPath();
+    series.forEach((p, i) => i ? ctx.lineTo(X(p.x), Y(p.y)) : ctx.moveTo(X(p.x), Y(p.y)));
+    ctx.stroke();
+    // current point dot
+    const cur = series.find(p => p.x === cy);
+    if (cur) {
+      ctx.fillStyle = opts.color;
+      ctx.beginPath(); ctx.arc(X(cur.x), Y(cur.y), 4, 0, 7); ctx.fill();
+      ctx.strokeStyle = "#1a1a19"; ctx.lineWidth = 2; ctx.stroke();
+    }
+    // hover crosshair
+    if (hoverX != null) {
+      const p = series.reduce((a, b) => Math.abs(b.x - hoverX) < Math.abs(a.x - hoverX) ? b : a);
+      ctx.strokeStyle = "#565650";
+      ctx.beginPath(); ctx.moveTo(X(p.x) + 0.5, padT); ctx.lineTo(X(p.x) + 0.5, H - padB); ctx.stroke();
+      ctx.fillStyle = opts.color;
+      ctx.beginPath(); ctx.arc(X(p.x), Y(p.y), 3.5, 0, 7); ctx.fill();
+      return p;
+    }
+  }
+  function evYear(ev) {
+    const r = canvas.getBoundingClientRect();
+    const padL = 44, padR = 8;
+    const xs = series.map(p => p.x);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs);
+    const frac = (ev.clientX - r.left - padL) / (r.width - padL - padR);
+    return x0 + Math.max(0, Math.min(1, frac)) * (x1 - x0);
+  }
+  canvas.addEventListener("mousemove", ev => {
+    const p = draw(evYear(ev));
+    if (p) {
+      tooltip.style.display = "block";
+      tooltip.style.left = (ev.clientX + 12) + "px";
+      tooltip.style.top = (ev.clientY - 30) + "px";
+      tooltip.innerHTML = `<b>${p.x}</b> · ${opts.fmtVal(p.y)}`;
+    }
+  });
+  canvas.addEventListener("mouseleave", () => { tooltip.style.display = "none"; draw(); });
+  canvas.addEventListener("click", ev => {
+    const yr = Math.round(evYear(ev));
+    let best = 0;
+    YEARS.forEach((y, i) => { if (Math.abs(y - yr) < Math.abs(YEARS[best] - yr)) best = i; });
+    setPlaying(false); setFrame(best);
+  });
+  return draw;
+}
+
+const elevSeries = Object.entries(ELEV)
+  .filter(([, v]) => v.elevation_ft)
+  .map(([y, v]) => ({ x: +y, y: v.elevation_ft }));
+const areaSeries = TIMELAPSE.years
+  .filter(e => e.sensor !== "MSS")
+  .map(e => ({ x: e.year, y: e.area_km2 }));
+
+const drawElev = buildChart($("chartElev"), elevSeries, {
+  color: "#3987e5",
+  refLine: { value: FULL_POOL_FT, label: "full pool 3,700 ft" },
+  fmtVal: v => v.toFixed(0) + " ft",
+});
+const drawArea = buildChart($("chartArea"), areaSeries, {
+  color: "#199e70",
+  fmtVal: v => Math.round(v).toLocaleString() + " km²",
+});
+function drawCharts() { drawElev(); drawArea(); }
+window.addEventListener("resize", () => { drawCharts(); positionDivider(); });
+
+/* ---------- boot ---------- */
+setFrame(YEARS.length - 1);
+positionDivider();
+</script>
+</body>
+</html>
