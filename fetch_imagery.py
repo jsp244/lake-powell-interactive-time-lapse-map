@@ -288,6 +288,19 @@ def render(sr, valid, mss=False):
     return np.moveaxis(img, 0, -1)
 
 
+def bands_healthy(sr, valid):
+    """Detect dead/flat bands (end-of-life MSS detectors render blood-red:
+    a healthy green band spans well over 0.02 reflectance across a desert+water
+    scene; a dead one is nearly constant)."""
+    if not valid.any():
+        return False
+    for bi in range(sr.shape[0]):
+        v = sr[bi][valid]
+        if float(np.percentile(v, 95) - np.percentile(v, 5)) < 0.02:
+            return False
+    return True
+
+
 def water_area_km2(sr, clear, mss=False):
     # TM/OLI: MNDWI (green vs SWIR). MSS has no SWIR: NDWI (green vs NIR).
     green = sr[1]
@@ -359,14 +372,15 @@ def process_year(catalog, year, aoi_poly, transform, width, height):
             sr, valid, clear = read_mosaic(chosen, transform, width, height)
         img = render(sr, valid, mss=mss)
         area, clear_frac = water_area_km2(sr, clear, mss=mss)
-        tries.append((area, img, clear_frac, aoi_bad, neg_cov, chosen))
-        if max_area is None or area <= max_area:
+        healthy = bands_healthy(sr, valid) if mss else True
+        tries.append((healthy, area, img, clear_frac, aoi_bad, neg_cov, chosen))
+        if healthy and (max_area is None or area <= max_area):
             break
         excluded.update(it.id for it in chosen)
-    # accept the first plausible try, else the least-inflated one
-    if max_area is not None:
-        tries.sort(key=lambda t: (t[0] > max_area, t[0]))
-    area, img, clear_frac, aoi_bad, neg_cov, chosen = tries[0]
+    # accept the first healthy+plausible try, else the least-broken one
+    cap = max_area if max_area is not None else float("inf")
+    tries.sort(key=lambda t: (not t[0], t[1] > cap, t[1]))
+    _, area, img, clear_frac, aoi_bad, neg_cov, chosen = tries[0]
     cov = -neg_cov
     dates = sorted({it.datetime.date().isoformat() for it in chosen})
     platforms_used = sorted({it.properties.get("platform", "?") for it in chosen})

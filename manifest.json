@@ -95,19 +95,18 @@
   {
    "year": 1977,
    "dates": [
-    "1977-08-07",
-    "1977-08-12"
+    "1977-06-13",
+    "1977-06-14"
    ],
    "platforms": [
-    "landsat-1",
     "landsat-2"
    ],
    "sensor": "MSS",
-   "cloud": 1.0,
-   "aoi_cloud": 0.001,
+   "cloud": 0.0,
+   "aoi_cloud": 0.004,
    "coverage": 1.0,
-   "clear_frac": 1.0,
-   "area_km2": 398.1,
+   "clear_frac": 0.996,
+   "area_km2": 470.4,
    "scenes": 4
   },
   {
