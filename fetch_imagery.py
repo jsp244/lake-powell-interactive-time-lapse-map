@@ -127,6 +127,17 @@ def build_set(primary_idx, scored, aoi_poly):
     return chosen, cov
 
 
+def geo_ok(it):
+    """Precision-registered? L1GS/L1GT (systematic georegistration, off by up
+    to kilometers) and modern Tier-2 scenes make the timelapse jump."""
+    corr = (it.properties.get("landsat:correction") or "").upper()
+    if corr == "L1TP":
+        return True
+    if corr.startswith("L1G"):
+        return False
+    return it.properties.get("landsat:collection_category") != "T2"
+
+
 def read_qa_bad_frac(items, transform, width, height):
     """Mosaic qa_pixel at 1/4 resolution over the AOI; return fraction of AOI
     pixels flagged cloud/cirrus/shadow."""
@@ -150,15 +161,18 @@ def read_qa_bad_frac(items, transform, width, height):
     return float((bad & valid).sum() / valid.sum())
 
 
-def pick_items(items, aoi_poly, transform, width, height):
-    """Evaluate up to 4 candidate scene-sets; score each by cloud/shadow inside
-    the AOI (per the QA band). Returns ranked [(aoi_bad_frac, -coverage, items)],
-    best first."""
+def pick_items(items, aoi_poly, transform, width, height, mss=False):
+    """Evaluate up to 4 candidate scene-sets. Each is scored by cloud/shadow
+    inside the AOI (per the QA band) plus a penalty for scenes without
+    precision georegistration — heavy for the modern era, mild for MSS where
+    per-scene phase correlation can rescue systematic offsets. Returns ranked
+    [(score, -coverage, items, aoi_bad_frac)], best first."""
     if not items:
         return []
+    geo_weight = 0.08 if mss else 0.5
     scored = score_groups(items, aoi_poly)
     candidates, seen = [], set()
-    for i in range(min(4, len(scored))):
+    for i in range(min(6, len(scored))):
         chosen, cov = build_set(i, scored, aoi_poly)
         sig = tuple(sorted(it.id for it in chosen))
         if sig not in seen:
@@ -173,9 +187,18 @@ def pick_items(items, aoi_poly, transform, width, height):
             bad = max(
                 it.properties.get("eo:cloud_cover", 100) for it in chosen
             ) / 100.0
-        results.append((bad, -cov, chosen))
-        if bad < 0.01:
-            break  # essentially clear over the lake; stop probing
+        geo_bad = sum(1 for it in chosen if not geo_ok(it)) / len(chosen)
+        l7_frac = sum(
+            1 for it in chosen if it.properties.get("platform") == "landsat-7"
+        ) / len(chosen)
+        # out-of-season scenes (snow, low sun) are a last resort only
+        winter_frac = sum(
+            1 for it in chosen if not (5 <= it.datetime.month <= 10)
+        ) / len(chosen)
+        score = bad + geo_weight * geo_bad + 0.06 * l7_frac + 0.3 * winter_frac
+        results.append((score, -cov, chosen, bad))
+        if score < 0.01:
+            break  # clear and registered; stop probing
     results.sort(key=lambda t: (t[0], t[1]))
     return results
 
@@ -219,13 +242,16 @@ def read_mosaic(items, transform, width, height):
     return sr, valid, clear
 
 
-def read_mosaic_mss(items, transform, width, height):
+def read_mosaic_mss(items, transform, width, height, ref_q=None):
     """MSS path: per scene, convert uint8 DN -> TOA reflectance using the scene's
-    radiometric calibration and sun elevation, then mosaic (first-valid wins).
-    Returns (bands[3,H,W]: red, green, nir09; valid; clear)."""
+    radiometric calibration and sun elevation, co-register the scene against the
+    1984 reference (per scene — a mosaic-level fit would let the majority
+    outvote one shifted scene), then mosaic (first-valid wins).
+    Returns (bands[3,H,W]: red, green, nir09; valid; clear; shifts)."""
     refl = np.zeros((len(MSS_BANDS), height, width), dtype=np.float32)
     filled = np.zeros((height, width), dtype=bool)
     qa = np.zeros((height, width), dtype=np.uint16)
+    shifts = []
     for it in items:
         signed = planetary_computer.sign(it)
         sun_el = np.radians(it.properties.get("view:sun_elevation", 60.0))
@@ -249,20 +275,90 @@ def read_mosaic_mss(items, transform, width, height):
             )
             bv = dn > 0
             item_valid = bv if item_valid is None else (item_valid & bv)
+            item_any = dn > 2 if bi == 0 else (item_any | (dn > 2))
         with rasterio.open(signed.assets["qa_pixel"].href) as src:
             with WarpedVRT(
                 src, crs=DST_CRS, transform=transform, width=width, height=height,
                 resampling=Resampling.nearest, src_nodata=1, nodata=1,
             ) as vrt:
                 qdata = vrt.read(1)
+        # some MSS products pad missing regions with DN~1-2 and a broken
+        # all-clear QA band; real terrain never has every band that dark
+        item_valid &= (qdata > 1) & item_any
+        if ref_q is not None:
+            dy, dx = estimate_shift(ref_q, item_refl[0], item_valid)
+            if (dy, dx) != (0, 0):
+                item_refl = shift2d(item_refl, dy, dx, 0.0)
+                item_valid = shift2d(item_valid, dy, dx, False)
+                qdata = shift2d(qdata, dy, dx, 1)
+            shifts.append([int(dy), int(dx)])
         hole = ~filled & item_valid
         refl[:, hole] = item_refl[:, hole]
         filled |= item_valid
-        qhole = qa <= 1
+        qhole = (qa <= 1) & item_valid
         qa[qhole] = qdata[qhole]
     refl = np.clip(refl, 0.0, 1.0)
     clear = filled & ((qa & QA_BAD_BITS) == 0)
-    return refl, filled, clear
+    return refl, filled, clear, shifts
+
+
+ALIGN_FACTOR = 4
+
+
+def load_align_reference(frames_dir, height, width):
+    """Grayscale 1984 TM frame (gold-standard georegistration) at quarter
+    resolution, mean-subtracted — the target scenes correlate against."""
+    from PIL import Image as PILImage
+
+    ref_path = frames_dir / "1984.jpg"
+    if not ref_path.exists():
+        return None
+    hq, wq = height // ALIGN_FACTOR, width // ALIGN_FACTOR
+    ref = np.asarray(
+        PILImage.open(ref_path).convert("L").resize((wq, hq)), dtype=np.float32
+    )
+    return ref - ref.mean()
+
+
+def estimate_shift(ref_q, band, valid):
+    """FFT phase correlation of one scene's red band (masked, quarter-res)
+    against the reference. Early L1GS products carry km-scale systematic
+    offsets; desert terrain gives a strong peak. Returns full-res (dy, dx)
+    to apply, or (0, 0) if correlation is out of range."""
+    f = ALIGN_FACTOR
+    hq, wq = ref_q.shape
+    mov = band[: hq * f, : wq * f].reshape(hq, f, wq, f).mean(axis=(1, 3))
+    vq = valid[: hq * f, : wq * f].reshape(hq, f, wq, f).mean(axis=(1, 3)) > 0.5
+    if vq.mean() < 0.1:
+        return 0, 0  # too little coverage to correlate
+    mov = np.where(vq, mov, mov[vq].mean())
+    mov = mov - mov.mean()
+    A = np.fft.rfft2(ref_q)
+    B = np.fft.rfft2(mov)
+    R = A * np.conj(B)
+    R /= np.abs(R) + 1e-9
+    c = np.fft.irfft2(R, ref_q.shape)
+    dy, dx = np.unravel_index(int(np.argmax(c)), c.shape)
+    if dy > hq // 2:
+        dy -= hq
+    if dx > wq // 2:
+        dx -= wq
+    # 1970s ephemeris errors reach tens of km — clamp only near the FFT
+    # wrap-around ambiguity limit
+    if abs(dy) > hq // 3 or abs(dx) > wq // 3:
+        return 0, 0  # implausible; leave unshifted
+    return int(dy) * f, int(dx) * f
+
+
+def shift2d(arr, dy, dx, fill):
+    if dy == 0 and dx == 0:
+        return arr
+    h, w = arr.shape[-2], arr.shape[-1]
+    out = np.full_like(arr, fill)
+    ys0, ys1 = max(0, dy), min(h, h + dy)
+    xs0, xs1 = max(0, dx), min(w, w + dx)
+    out[..., ys0:ys1, xs0:xs1] = arr[..., ys0 - dy : ys1 - dy, xs0 - dx : xs1 - dx]
+    return out
 
 
 def render(sr, valid, mss=False):
@@ -336,52 +432,75 @@ def process_year(catalog, year, aoi_poly, transform, width, height):
             (("05-01", "10-31"), 60, None),
         ]
         collection = COLLECTION
-    all_items, seen_items, ranked = [], set(), []
+    # pool every rung up front: early-stopping on the first passable rung can
+    # hide the date that pixel-coverage fills or dropout retries will need
+    all_items, seen_items = [], set()
     for season, cloud, platforms in attempts:
         for it in search_year(catalog, year, season, cloud, platforms, collection):
             if it.id not in seen_items:
                 seen_items.add(it.id)
                 all_items.append(it)
-        ranked = [
-            r
-            for r in pick_items(all_items, aoi_poly, transform, width, height)
-            if -r[1] >= 0.7
-        ]
-        if ranked and ranked[0][0] < 0.03 and -ranked[0][1] >= 0.985:
-            break
-    if not ranked:
+    if not all_items:
         return None
+
+    ref_q = (
+        load_align_reference(Path(__file__).parent / "frames", height, width)
+        if mss
+        else None
+    )
+
+    def read_set(items):
+        if mss:
+            return read_mosaic_mss(items, transform, width, height, ref_q)
+        return read_mosaic(items, transform, width, height) + ([],)
+
     # MSS detector-dropout streaks can masquerade as water; if the area is
     # physically impossible for the era, retry with the tried dates excluded.
     # (Pool first neared full in 1979; before that ~600 km2 is the ceiling.)
     max_area = (600.0 if year <= 1978 else MSS_MAX_PLAUSIBLE_KM2) if mss else None
     tries, excluded = [], set()
-    for _ in range(3 if mss else 1):
+    for _ in range(4 if mss else 1):
         pool = [it for it in all_items if it.id not in excluded]
         cands = [
             r
-            for r in pick_items(pool, aoi_poly, transform, width, height)
+            for r in pick_items(pool, aoi_poly, transform, width, height, mss)
             if -r[1] >= 0.7
         ]
         if not cands:
             break
-        aoi_bad, neg_cov, chosen = cands[0]
-        if mss:
-            sr, valid, clear = read_mosaic_mss(chosen, transform, width, height)
-        else:
-            sr, valid, clear = read_mosaic(chosen, transform, width, height)
+        _, neg_cov, chosen, aoi_bad = cands[0]
+        chosen = list(chosen)
+        sr, valid, clear, shift_px = read_set(chosen)
+        # STAC footprints lie: verify PIXEL coverage, and fill real holes with
+        # the next-best candidate sets (prefer registered, low-cloud fills)
+        for fill in cands[1:]:
+            if float(valid.mean()) >= 0.96 or len(chosen) >= 8:
+                break
+            have = {c.id for c in chosen}
+            extra = [it for it in fill[2] if it.id not in have]
+            if not extra:
+                continue
+            chosen += extra
+            sr, valid, clear, shift_px = read_set(chosen)
+        pixcov = float(valid.mean())
         img = render(sr, valid, mss=mss)
         area, clear_frac = water_area_km2(sr, clear, mss=mss)
         healthy = bands_healthy(sr, valid) if mss else True
-        tries.append((healthy, area, img, clear_frac, aoi_bad, neg_cov, chosen))
-        if healthy and (max_area is None or area <= max_area):
+        tries.append((healthy, pixcov, area, img, clear_frac, aoi_bad, chosen, shift_px))
+        print(
+            f"  try: {sorted({i.datetime.date().isoformat() for i in chosen})} "
+            f"healthy={healthy} pixcov={pixcov:.3f} area={area} shift={shift_px}",
+            flush=True,
+        )
+        if healthy and pixcov >= 0.9 and (max_area is None or area <= max_area):
             break
         excluded.update(it.id for it in chosen)
-    # accept the first healthy+plausible try, else the least-broken one
+    if not tries:
+        return None
+    # accept the first healthy+complete+plausible try, else the least-broken one
     cap = max_area if max_area is not None else float("inf")
-    tries.sort(key=lambda t: (not t[0], t[1] > cap, t[1]))
-    _, area, img, clear_frac, aoi_bad, neg_cov, chosen = tries[0]
-    cov = -neg_cov
+    tries.sort(key=lambda t: (not t[0], t[1] < 0.9, t[2] > cap, -t[1], t[2]))
+    _, pixcov, area, img, clear_frac, aoi_bad, chosen, shift_px = tries[0]
     dates = sorted({it.datetime.date().isoformat() for it in chosen})
     platforms_used = sorted({it.properties.get("platform", "?") for it in chosen})
     clouds = [it.properties.get("eo:cloud_cover", -1) for it in chosen]
@@ -394,10 +513,12 @@ def process_year(catalog, year, aoi_poly, transform, width, height):
             "sensor": "MSS" if mss else "TM/OLI",
             "cloud": round(max(clouds), 1),
             "aoi_cloud": round(aoi_bad, 3),
-            "coverage": round(cov, 3),
+            "coverage": round(pixcov, 3),
             "clear_frac": clear_frac,
             "area_km2": area,
             "scenes": len(chosen),
+            "scene_ids": sorted(it.id for it in chosen),
+            "aligned_px": list(shift_px),
         },
     }
 
@@ -463,7 +584,8 @@ def main():
             print(
                 f"{year}: {m['scenes']} scene(s) {m['dates']} {m['platforms']} "
                 f"cloud={m['cloud']}% lake_cloud={m['aoi_cloud']} cov={m['coverage']} "
-                f"area={m['area_km2']} km2 ({time.time() - t0:.0f}s)",
+                f"area={m['area_km2']} km2 align={m['aligned_px']} "
+                f"({time.time() - t0:.0f}s)",
                 flush=True,
             )
     print("done", flush=True)
