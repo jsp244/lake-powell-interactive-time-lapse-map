@@ -4,7 +4,7 @@ Watch Lake Powell fill and drain across **55 years of satellite imagery — ever
 year from 1972 to 2026** — from the first Landsat pass ever flown over Glen
 Canyon to today's record-low reservoir.
 
-**[▶ Use it in your browser](https://jp244btc.github.io/lake-powell-interactive-time-lapse-map/)**
+**[▶ Use it in your browser](https://jsp244.github.io/lake-powell-interactive-time-lapse-map/)**
 · **[⬇ Download the Windows app](../../releases/latest)** (no install, single exe)
 
 | 1983 — full pool (3,700 ft) | 2026 — 178 ft lower |
