@@ -81,4 +81,3 @@ page pick it up automatically, no rebuild needed.
 
 Code: MIT. Imagery: USGS/NASA Landsat (public domain), served by Microsoft
 Planetary Computer. Hydrology: U.S. Bureau of Reclamation (public domain).
-Built with Claude Code.
